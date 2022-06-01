@@ -1,0 +1,8 @@
+{"type":"record",
+ "name":"schema",
+ "fields":[
+          {"name":"flight_id","type":"string"},
+          {"name":"flight_to", "type": "string"}, 
+          {"name":"flight_from", "type": "string"}
+         ]
+}
