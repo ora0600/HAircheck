@@ -158,6 +158,21 @@ source env-vars
 ```
 iterm Terminals with producer and consumer start automatically. Replcator is started, if you now produce into source cluster the content will be replicated into target cluster:
 
+## Drop Topic in Source Cluster
+Typically customers want to protect yourself for human errors. So, the big question, how can you protect your environment for deleting topics?
+Let's try to play this use case in our replicator use case demo.
+Drop the topic in source cluster and see if the topic will be dropped as well in destination cluster.
+* topic.poll.interval.ms: How often to poll for new topics matching whitelist or regex. (default 120000)
+* topic.auto.create: whether to auto create topics in destination cluster
+* topic.config.sync: whether to periodically sync topic configuration to destination cluster (defaults to true)
+```bash
+kafka-topics --bootstrap-server $(cat ccloud_user1.properties | grep "bootstrap.servers" | cut -d'=' -f2) --command-config ccloud_user1.properties --delete --topic cmorders_avro
+# check topic in source
+kafka-topics --bootstrap-server $(cat ccloud_user1.properties | grep "bootstrap.servers" | cut -d'=' -f2) --command-config ccloud_user1.properties --list
+# check topic in target
+kafka-topics --bootstrap-server $(cat ccloud_user2.properties | grep "bootstrap.servers" | cut -d'=' -f2) --command-config ccloud_user2.properties --list
+```
+Source Topic cmorders_avro was dropped and should not visible anymore. Target topic cmorders_avro is still there. You could restore topic including content to replicate back into source  cluster, this is not covered here.
 ## Stop the demo showcase
 To delete the complete environment:
 ```bash
@@ -181,8 +196,129 @@ cd dr-cluster-demo/
 The `00_setup_ccloud_dr_cluster.sh` will create an DR environment. In failover case and need to do the failover manuelly.
 Please follow the documentation or follow this [script](dr-cluster-demo/manual_failover.md).
 
+### Delete topic in source cluster
+Does this DR feature also protect for human errors, like deleting a topic, let's try.
+```bash
+confluent kafka topic delete $topic1 --cluster $source_id --environment $environment
+# Deleted topic "project.a1.orders".
+# Shold be able to consume from DR
+confluent kafka topic consume $topic1 --from-beginning --environment env-w7z1qj --cluster $destination_id --api-key $destinationkey
+```
+The cluster link should still exists and the mirror topic in DR cluster as well. The mirror topic is still read only.
+![clusterlink](img/mirror_topic_in_dr.png)
+Now you have copy of your deleted topic. You can restore the topic e.g. with [kcat](https://rmoff.net/2019/09/29/copying-data-between-kafka-clusters-with-kafkacat/). This is not covered here. 
+After a while you will get the information that mirroring failed.
+But you still consume from mirror topic `confluent kafka topic consume $topic1 --from-beginning --environment env-w7z1qj --cluster $destination_id --api-key $destinationkey` till retention policy.
+![cluster link mirroring failed](img/mirroring_failed.png)
+
 ### Clean demo environment
 ```bash
 cd dr-cluster-demo/
 ./01_delete_ccloud_dr_cluster.sh
 ```
+## Connect Cluster with Confluent Cloud
+This sample is not HA in general. It show more or less, how easy it is to run a self-managed connect cluster in k8s connecting against Confluent cloud.
+Most of our customers running a combination of self-managed connect cluster and fully managed connectors in Confluent Cloud. Reasons are very different:
+ * Network limits
+ * Connector is not fully-managed
+ * Connector need a special setup which can not addressed in Confluent Cloud.
+ * any others
+A best practice deployment would look like the next diagram.
+![Self-Managed Cluster with K8s](img/connect_cluster_with_cfk.png)
+The k8s infrastruce could be everything like AKS, EKS, GKE, openshift, vanilla k8s etc.
+
+The deployment is very easy with Confluent for Kubernetes (CFK). With a running Confluent Cloud UBB contract you will get an enterprise license and are allowed to run CFK.
+Please follow my runbook for provision a connect cluster with datagen connector producing into Confluent Cloud.
+```bash
+cd self-managed_connect_cluster/
+# start docker
+### start minicube
+minikube start --kubernetes-version=v1.22.2
+minikube status
+
+### Install CFK
+# Create namespace to use
+kubectl create ns confluent
+# Set namespace for current context to `confluent`. With this in place, all subsequent kubectl commands will assume that the namespace to use is `confluent`
+kubectl config set-context --current --namespace confluent
+kubectl get namespace
+# Check your kubectl context
+kubectl config get-contexts
+
+# Add the Confluent Helm repository. Helm is used to package the Confluent for Kubernetes(CFK) Operator and CRDs.
+helm repo add confluentinc https://packages.confluent.io/helm
+# Install CFK Operator
+helm install cfk-operator confluentinc/confluent-for-kubernetes -n confluent
+
+# Once install is successful, you'll see the installed chart
+helm list -n confluent
+# Output should look like this
+# NAME          NAMESPACE  REVISION  STATUS    CHART                              APP VERSION
+# cfk-operator  confluent  1         updated     confluent-for-kubernetes-0.174  2.0.2
+
+# The Helm chart deploys the Confluent for Kubernetes  (CFK) Operator as a pod. You should see it up and running.
+kubectl get pods -n confluent
+# Output should look like this
+# NAME                                  READY   STATUS    RESTARTS   AGE
+# confluent-operator-66bcf88444-vd5gg   1/1     Running   0          14h
+
+# get CFK examples see https://github.com/confluentinc/confluent-kubernetes-examples/tree/master/hybrid/ccloud-connect-confluent-hub
+wget https://github.com/confluentinc/confluent-kubernetes-examples/archive/refs/heads/master.zip
+unzip master.zip 
+cd confluent-kubernetes-examples-master/hybrid/ccloud-connect-confluent-hub/
+export TUTORIAL_HOME=./self-managed_connect_cluster//confluent-kubernetes-examples-master/hybrid/ccloud-connect-confluent-hub
+
+# Add credentials into txt fields, before that change it to your setup, you can the samples in github-repo
+kubectl create secret generic ccloud-credentials --from-file=plain.txt=ccloud-credentials.txt
+kubectl create secret generic ccloud-sr-credentials --from-file=basic.txt=ccloud-sr-credentials.txt
+## API key from my cluster 
+cat ccloud-credentials.txt
+kubectl get secret ccloud-credentials
+## SR API KEy
+cat ccloud-sr-credentials.txt
+kubectl get secret ccloud-sr-credentials
+# Add everything into yml, show the on-demand part in connect, change this yaml to your setup (Bootstrap-Server, SR-URL, Connectors)
+cat kafka-connect.yaml
+
+# Provision Connect cluster
+kubectl apply -f $TUTORIAL_HOME/kafka-connect.yaml
+kubectl get pods -n confluent
+#### WAIT a WHILE 5 min
+# open Port to CONNECT RESTA API
+kubectl port-forward connect-0 8083
+# get connectors
+curl http://localhost:8083/connectors/
+curl http://localhost:8083/connector-plugins/ | jq
+
+# Open a different terminal and start the connector
+# Create Datagen Connector
+curl -X PUT \
+-H "Content-Type: application/json" \
+--data '{
+	"name": "datagen-users",
+	"connector.class": "io.confluent.kafka.connect.datagen.DatagenConnector",
+	"tasks.max": "1",
+	"kafka.topic": "users",
+	"quickstart": "USERS",
+	"key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "max.interval": "100",
+    "iterations": "10000000"
+}' \
+http://localhost:8083/connectors/datagen-users/config | jq .
+
+# check status
+curl -X GET http://localhost:8083/connectors/datagen-users | jq
+curl -X GET http://localhost:8083/connectors/datagen-users/status | jq
+
+#Check in ccloud UI in topic viewer under topic users
+
+# delete connector
+curl -X DELETE http://localhost:8083/connectors/datagen-users/ | jq
+# Delete connect cluster
+kubectl delete -f $TUTORIAL_HOME/kafka-connect.yaml
+kubectl get pods -n confluent
+minikube stop
+```
+The HA part need to be configured. Add additional workers (replica) etc.
